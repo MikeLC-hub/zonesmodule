@@ -6,8 +6,19 @@
  */
 
 /** 1. SPATIAL ENUMERATORS & CONSTANTS */
-
+const CMD_JOIN: string = " ";
 const enum VECTOR { Base, Origin, Terminal, Anchor, Delta };
+const enum SECTORCONFIG {
+    config_0,
+    config_1,
+    config_2,
+    config_3,
+    config_4,
+}
+
+const enum DIRECTION {
+    North, South, West, East
+};
 
 const VECTORS: { [vector_key: number]: string } = {
     [VECTOR.Base]: 'base',
@@ -88,6 +99,413 @@ type ZonePatterns = {
     Grid: Zone[];
 };
 
+interface CoordXZ {
+    readonly x: number;
+    readonly z: number;
+};
+
+/** 1. THE CHUNK LAYER */
+
+type ChunkID = {
+    readonly cX: number;
+    readonly cZ: number;
+};
+
+interface Chunk extends ChunkID {
+    toCoord(): Coord3D;
+    toWorld(): Position;
+    toString(): string;
+};
+
+interface LengthConfig {
+    lX: number;
+    lZ: number;
+};
+
+interface ConfigEvaluation {
+    config: LengthConfig;
+    remaining: number;
+}
+
+interface SectorInfo {
+    origin: ChunkID;
+    config: LengthConfig;
+};
+
+interface Sector extends SectorInfo {
+    readonly ID: string;
+    index: number;
+    is_active: boolean;
+    contains(chunk: Chunk): boolean;
+};
+class MinecraftChunk implements Chunk {
+    public static readonly XZ_LENGTH: number = 16;
+    public static readonly CLASS_STRING: string = "chunk";
+
+    public static getChunkID(x: number, z: number): ChunkID {
+        const cX: number = (x | 0) >> 4;
+        const cZ: number = (z | 0) >> 4;
+        return { cX, cZ } as ChunkID;
+    }
+
+    private static _determineCoordXZ(cX: number, cZ: number): CoordXZ {
+        const x: number = (cX | 0) << 4;
+        const z: number = (cZ | 0) << 4;
+        return { x, z } as CoordXZ;
+    }
+
+    private static _is(chunk0: ChunkID, chunk1: ChunkID): boolean {
+        return (chunk0.cX === chunk1.cX && chunk0.cZ === chunk1.cZ);
+    };
+
+    private static _containsCoord(chunk: ChunkID, query: CoordXZ): boolean {
+        const query_chunk: ChunkID = MinecraftChunk.getChunkID(query.x, query.z);
+        return MinecraftChunk._is(chunk, query_chunk);
+    }
+
+    public static getOffsetChunkID(chunk: ChunkID, config: LengthConfig): ChunkID {
+        return {
+            cX: (chunk.cX + config.lX - 1) | 0,
+            cZ: (chunk.cZ + config.lZ - 1) | 0
+        } as ChunkID;
+    }
+
+    public static getCoordChunkID(coord: CoordXZ | Coord3D): ChunkID {
+        return MinecraftChunk.getChunkID(coord.x, coord.z);
+    }
+
+    public static getWorldChunkID(pos0: Position): ChunkID {
+        const world_pos: Position = pos0.toWorld();
+        return MinecraftChunk.getChunkID(
+            world_pos.getValue(Axis.X),
+            world_pos.getValue(Axis.Z)
+        );
+    }
+
+    public static getStringChunkID(str: string): ChunkID {
+        let cX: number = 0;
+        let cZ: number = 0;
+        const unstrung: string[] = str.split("_");
+        if (unstrung.length === 3 && unstrung[0] === MinecraftChunk.CLASS_STRING) {
+            cX = parseInt(unstrung[1].replace("cX", ""));
+            cZ = parseInt(unstrung[2].replace("cZ", ""));
+        }
+        return { cX, cZ };
+    }
+
+    public static offsetChunk(chunk: ChunkID, config: LengthConfig): MinecraftChunk {
+        const offset_id: ChunkID = MinecraftChunk.getOffsetChunkID(chunk, config);
+        return new MinecraftChunk(offset_id);
+    }
+
+    public static fromWorld(pos0: Position): MinecraftChunk {
+        const world_id: ChunkID = MinecraftChunk.getWorldChunkID(pos0);
+        return new MinecraftChunk(world_id);
+    }
+
+    public static fromCoord(coord: CoordXZ | Coord3D): MinecraftChunk {
+        const coord_id: ChunkID = MinecraftChunk.getCoordChunkID(coord);
+        return new MinecraftChunk(coord_id);
+    }
+
+    public static fromString(chunk_str: string): MinecraftChunk | null {
+        const string_id: ChunkID = MinecraftChunk.getStringChunkID(chunk_str);
+        if (string_id.cX !== undefined && string_id.cZ !== undefined) return new MinecraftChunk(string_id);
+        return null;
+    }
+
+    public static toWorld(chunk: ChunkID): Position {
+        const blocks = MinecraftChunk._determineCoordXZ(chunk.cX, chunk.cZ);
+        return world(blocks.x, 0, blocks.z);
+    }
+
+    public static toCoord(chunk: ChunkID): Coord3D {
+        const blocks = MinecraftChunk._determineCoordXZ(chunk.cX, chunk.cZ);
+        return { x: blocks.x, y: 0, z: blocks.z };
+    }
+
+    public static toString(chunk: ChunkID): string {
+        return MinecraftChunk.CLASS_STRING + "_cX" + chunk.cX + "_cZ" + chunk.cZ;
+    }
+
+    public readonly cX: number;
+    public readonly cZ: number;
+
+    public constructor(info: ChunkID) {
+        this.cX = info.cX | 0;
+        this.cZ = info.cZ | 0;
+    }
+
+    public is(query: ChunkID): boolean { return MinecraftChunk._is(this, query) };
+    public contains(query: CoordXZ): boolean { return MinecraftChunk._containsCoord(this, query); };
+    public offset(config: LengthConfig): MinecraftChunk { return MinecraftChunk.offsetChunk(this, config); };
+    public toWorld(): Position { return MinecraftChunk.toWorld(this); };
+    public toCoord(): Coord3D { return MinecraftChunk.toCoord(this); };
+    public toString(): string { return MinecraftChunk.toString(this); };
+}
+
+class TickingSector implements Sector {
+    public static readonly MAX_ACTIVE_SECTORS: number = 10;
+    public static readonly MAX_SECTOR_CHUNKS: number = 100;
+
+    public static readonly CONFIGURATION: { [key: number]: LengthConfig } = {
+        [SECTORCONFIG.config_0]: { lX: 25, lZ: 4 },
+        [SECTORCONFIG.config_1]: { lX: 20, lZ: 5 },
+        [SECTORCONFIG.config_2]: { lX: 10, lZ: 10 },
+        [SECTORCONFIG.config_3]: { lX: 5, lZ: 20 },
+        [SECTORCONFIG.config_4]: { lX: 4, lZ: 25 }
+    };
+
+    public static get CONFIG_SIZE(): number {
+        return Object.keys(TickingSector.CONFIGURATION).length;
+    }
+
+    public static toSectorConfig(config: LengthConfig): LengthConfig {
+        const _lX: number = config.lX;
+        let sector_config: LengthConfig = TickingSector.CONFIGURATION[SECTORCONFIG.config_2];
+
+        for (let config_index = 0; config_index < TickingSector.CONFIG_SIZE; config_index++) {
+            const this_config: LengthConfig = TickingSector.CONFIGURATION[config_index];
+            if (this_config.lX >= _lX) {
+                sector_config = this_config;
+                break;
+            }
+        }
+        return sector_config;
+    }
+
+    private static ActiveSectors: TickingSector[] = [];
+    private static SectorCount: number = 0;
+
+    private static _updateActiveIndexes(): void {
+        for (let i = 0; i < TickingSector.ActiveSectors.length; i++) {
+            TickingSector.ActiveSectors[i]._index = i | 0;
+        }
+    }
+
+    private static _newSectorID(): string {
+        return "sector_" + TickingSector.SectorCount++;
+    }
+
+    public static toSectorInfo(chunk0: ChunkID, chunk1: ChunkID): SectorInfo {
+        const origin: MinecraftChunk = new MinecraftChunk({
+            cX: Math.min(chunk0.cX, chunk1.cX) | 0,
+            cZ: Math.min(chunk0.cZ, chunk1.cZ) | 0
+        });
+        const config: LengthConfig = TickingSector.toSectorConfig({
+            lX: Math.abs(chunk1.cX - chunk0.cX) + 1,
+            lZ: Math.abs(chunk1.cZ - chunk0.cZ) + 1
+        });
+        return { origin, config };
+    }
+
+    public static getTerminal(sector: SectorInfo): Chunk {
+        return MinecraftChunk.offsetChunk(sector.origin, sector.config);
+    }
+
+    public static containsChunk(sector: SectorInfo, chunk: ChunkID): boolean {
+        const secX = sector.origin.cX | 0;
+        const secZ = sector.origin.cZ | 0;
+        const lX = sector.config.lX | 0;
+        const lZ = sector.config.lZ | 0;
+        const relX = (chunk.cX - secX + 1) | 0;
+        const relZ = (chunk.cZ - secZ + 1) | 0;
+        return (relX > 0 && relX <= lX) && (relZ > 0 && relZ <= lZ);
+    }
+
+    public static getAdjacent(sector: SectorInfo, direction: DIRECTION): SectorInfo {
+        const _config: LengthConfig = sector.config;
+        let cX: number = sector.origin.cX;
+        let cZ: number = sector.origin.cZ;
+
+        switch (direction) {
+            case DIRECTION.North:
+                cZ -= _config.lZ;
+                break;
+            case DIRECTION.South:
+                cZ += _config.lZ;
+                break;
+            case DIRECTION.West:
+                cX -= _config.lX;
+                break;
+            case DIRECTION.East:
+                cX += _config.lX;
+                break;
+        }
+        return { origin: { cX, cZ }, config: _config };
+    }
+
+    public static getActiveIndex(sector: SectorInfo): number {
+        TickingSector._updateActiveIndexes();
+        const target_cX = sector.origin.cX;
+        const target_cZ = sector.origin.cZ;
+        const target_lX = sector.config.lX;
+        const target_lZ = sector.config.lZ;
+
+        for (let active_sector of TickingSector.ActiveSectors) {
+            const cX_match: boolean = (active_sector.origin.cX === target_cX);
+            const cZ_match: boolean = (active_sector.origin.cZ === target_cZ);
+            const lX_match: boolean = (active_sector.config.lX === target_lX);
+            const lZ_match: boolean = (active_sector.config.lZ === target_lZ);
+
+            if (cX_match && cZ_match && lX_match && lZ_match) return active_sector.index;
+        }
+        return -1;
+    }
+
+    public static getChunkActiveIndex(chunk: ChunkID): number {
+        TickingSector._updateActiveIndexes();
+        for (let active_sector of TickingSector.ActiveSectors) {
+            if (active_sector.contains(chunk)) return active_sector.index;
+        }
+        return -1;
+    }
+
+    public static activateSector(sector: SectorInfo): void {
+        const active_index: number = TickingSector.getActiveIndex(sector);
+        if (active_index >= 0) return; // returns if already active.
+
+        while (TickingSector.ActiveSectors.length >= TickingSector.MAX_ACTIVE_SECTORS) {
+            const oldest = TickingSector.ActiveSectors.shift();
+            if (oldest) TickingSector.removeSector(oldest);
+        }
+
+        const ticking_sector = new TickingSector(sector)
+
+        const cmd: string[] = ["tickingarea add"];
+        cmd.push(ticking_sector.origin.toWorld().toString());
+        cmd.push(ticking_sector.terminal.toWorld().toString());
+        cmd.push(ticking_sector.ID);
+
+        player.execute(cmd.join(CMD_JOIN));
+        TickingSector.ActiveSectors.push(ticking_sector);
+        TickingSector._updateActiveIndexes();
+    }
+
+    public static removeSector(sector: SectorInfo): void {
+        const idx = TickingSector.getActiveIndex(sector);
+        if (idx === -1) return;
+
+        const active_sector = TickingSector.ActiveSectors[idx]
+
+        const cmd: string[] = ["tickingarea remove"]
+        cmd.push(active_sector.ID)
+        player.execute(cmd.join(CMD_JOIN));
+
+        TickingSector.ActiveSectors.splice(idx, 1);
+        active_sector._index = -1;
+        TickingSector._updateActiveIndexes();
+    };
+
+    public static removeAll(): void {
+        const cmd_str: string = "tickingarea remove_all";
+        player.execute(cmd_str);
+        for (let this_sector of TickingSector.ActiveSectors) { this_sector._index = -1; };
+        TickingSector.ActiveSectors = [];
+        TickingSector.SectorCount = 0;
+    }
+
+    public static ensureActiveChunk(chunk: ChunkID, config?: LengthConfig): void {
+        const active_sectors: Sector[] = TickingSector.ActiveSectors;
+
+        if (active_sectors.length === 0) {
+            const sector_origin: ChunkID = chunk;
+            const sector_config: LengthConfig = config ? TickingSector.toSectorConfig(config) : TickingSector.CONFIGURATION[SECTORCONFIG.config_2];
+            TickingSector.activateSector({
+                origin: sector_origin,
+                config: sector_config
+            });
+            return;
+        }
+
+        const active_index: number = TickingSector.getChunkActiveIndex(chunk);
+        if (active_index >= 0) return;
+
+        for (let this_sector of active_sectors) {
+            for (let adj_index = 0; adj_index < 4; adj_index++) {
+                const adj_sector: SectorInfo = TickingSector.getAdjacent(this_sector, adj_index);
+                const in_adjacent: boolean = TickingSector.containsChunk(adj_sector, chunk);
+
+                if (in_adjacent) {
+                    TickingSector.activateSector(adj_sector);
+                    return;
+                }
+            }
+        }
+    }
+
+    public static ensureActiveAround(x: number, z: number, config?: LengthConfig): void {
+        const this_chunk: ChunkID = MinecraftChunk.getChunkID(x, z);
+        TickingSector.ensureActiveChunk(this_chunk, config);
+    };
+
+    /**
+     * Evaluates how well a configuration fits a specific chunk length.
+     * Lower 'remaining' means less wasted space or fewer partial sectors.
+     */
+    private static _evaluateConfig(config: LengthConfig, length: number, z_dom?: boolean): ConfigEvaluation {
+        const config_length = z_dom ? config.lZ : config.lX;
+        const remaining: number = length % config_length;
+        return { config, remaining };
+    }
+
+    /**
+     * Comparison logic to keep the configuration with the smallest remainder.
+     */
+    private static _lessRemaining(eval0: ConfigEvaluation, eval1?: ConfigEvaluation): ConfigEvaluation {
+        if (eval1 && eval1.remaining < eval0.remaining) return eval1;
+        return eval0;
+    }
+
+    /**
+     * Determines the optimal LengthConfig for a Zone based on its X/Z dimensions.
+     * Minimizes "overshoot" where a ticking area covers significantly more than the zone.
+     */
+    public static ZoneXZconfig(length_x: number, length_z: number): LengthConfig {
+        const z_dom: boolean = (length_z > length_x);
+        const offset_length: number = z_dom ? length_z + 15 : length_x + 15;
+
+
+        // Convert block length to total chunk length (rounding up)
+        const chunk_length: number = (offset_length | 0) >> 4;
+
+        const configs = TickingSector.CONFIGURATION;
+        const configs_length = TickingSector.CONFIG_SIZE;
+
+        let best_evaluation: ConfigEvaluation = TickingSector._evaluateConfig(configs[0], chunk_length, z_dom);
+
+        for (let config_idx = 1; config_idx < configs_length; config_idx++) {
+            const evaluation = TickingSector._evaluateConfig(configs[config_idx], chunk_length, z_dom);
+            best_evaluation = TickingSector._lessRemaining(best_evaluation, evaluation);
+        }
+
+        // Default fallback to 10x10 if something goes wrong
+        return best_evaluation ? best_evaluation.config : TickingSector.CONFIGURATION[SECTORCONFIG.config_2];
+    }
+
+
+    public readonly ID: string;
+    public readonly origin: Chunk;
+    public readonly config: LengthConfig;
+    private _index: number = -1;
+
+    constructor(sector: SectorInfo) {
+        this.ID = TickingSector._newSectorID();
+        this.origin = new MinecraftChunk(sector.origin);
+        this.config = TickingSector.toSectorConfig(sector.config);
+    };
+
+    public get terminal(): Chunk { return TickingSector.getTerminal(this); };
+    public get index(): number { return this._index; };
+    public set index(num: number) {
+        const active_idx = TickingSector.getActiveIndex(this);
+        if (num < 0 && active_idx >= 0) TickingSector.removeSector(this);
+        else if (num >= 0 && active_idx === -1) TickingSector.activateSector(this);
+    };
+    public get is_active(): boolean { return this.index >= 0; };
+    public set is_active(bool: boolean) { this.index = bool ? 0 : -1; };
+    public contains(chunk: ChunkID): boolean { return TickingSector.containsChunk(this, chunk); }
+}
 /**
  * 3. THE VECTOR LAYER (Logic-enabled Coord3D)
  */
@@ -458,6 +876,8 @@ class MinecraftZone implements Zone {
         const net_y_blocks: number = zone.Y.blocks - 1;
         const net_z_blocks: number = zone.Z.blocks - 1;
 
+        const SECTOR_LENGTHS: LengthConfig = TickingSector.ZoneXZconfig(zone.X.length, zone.Z.length);
+
         const TOTAL_COUNT: number = x_count * y_count * z_count;
 
         let IN_PROGRESS: boolean = true; MinecraftZone.IN_PROGRESS = IN_PROGRESS;
@@ -480,8 +900,12 @@ class MinecraftZone implements Zone {
             const cmd_str = "titleraw @s actionbar {\"rawtext\":[{\"text\":\"§a✔ Finished " + zone.Name + " in " + time_string + "\"}]}";
             ExecuteCmd(cmd_str);
         }
+        const EnsureSectorActive= (x: number, z: number) => {
+            TickingSector.ensureActiveAround(x, z, SECTOR_LENGTHS);
+        };
         const CleanUp = () => {
-            IN_PROGRESS = false
+            TickingSector.removeAll()
+            IN_PROGRESS = false;
             MinecraftZone.IN_PROGRESS = IN_PROGRESS;
         };
 
@@ -501,16 +925,16 @@ class MinecraftZone implements Zone {
 
                 const oz = anchor_z + (dz * z_interval);
                 const tz = oz + net_z_blocks;
-
-                UpdateProgress(zone_index);
+                EnsureSectorActive(ox, tx);
+                EnsureSectorActive(tx, tz);
                 // Y Loop (The innermost workhorse)
                 for (let dy = 0; dy < y_count; dy++) {
                     if (!IN_PROGRESS) {
                         CleanUp();
                         return;
                     }
-                    
-                    if (zone_index % 64) loops.pause(1);
+                    if (zone_index % 8 === 0) UpdateProgress(zone_index);
+                    if (zone_index % 64 === 0) loops.pause(1);
                     const oy = anchor_y + (dy * y_interval);
                     const ty = oy + net_y_blocks;
 
